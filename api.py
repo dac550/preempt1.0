@@ -31,6 +31,7 @@ prompt 级 mode 字段：
 from openai import OpenAI
 import json
 from typing import List, Tuple, Dict
+import re
 
 
 class NERAPI:
@@ -224,8 +225,10 @@ t2 类（数值敏感实体，需额外标注 proc 字段）：
             temperature=0.1,
             response_format={"type": "json_object"}
         )
+        content = completion.choices[0].message.content
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
 
-        result = json.loads(completion.choices[0].message.content)
+        result = json.loads(content)
 
         mode = result.get("mode", "standard")
         if mode not in ("standard", "symbolic"):
