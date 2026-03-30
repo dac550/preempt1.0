@@ -28,7 +28,6 @@ prompt 级 mode 字段：
   dag_module.py 同步支持 parent_tokens 解析和 agg 推导。
 """
 
-from openai import OpenAI
 import json
 from typing import List, Tuple, Dict
 import re
@@ -36,7 +35,7 @@ import requests
 
 
 class NERAPI:
-    def __init__(self, model: str = "qwen3.5:4b", base_url: str = "http://localhost:11434"):
+    def __init__(self, model: str = "qwen3.5-4b", base_url: str = "http://localhost:11434"):
         self.model = model
         self.base_url = base_url
         self.system_prompt = """
