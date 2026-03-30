@@ -32,14 +32,13 @@ from openai import OpenAI
 import json
 from typing import List, Tuple, Dict
 import re
+import requests
 
 
 class NERAPI:
-    def __init__(self, api_key: str = "sk-0a03fbbbda894a378d46030eea8b41ad"):
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-        )
+    def __init__(self, model: str = "qwen3.5:4b", base_url: str = "http://localhost:11434"):
+        self.model = model
+        self.base_url = base_url
         self.system_prompt = """
 你是一个实体识别、数值关系分析与处理方式判断专家。
 对用户输入的句子，请同时完成三项任务：
@@ -216,16 +215,24 @@ t2 类（数值敏感实体，需额外标注 proc 字段）：
                    t1 实体 proc="",  t2 实体 proc="perturb"|"symbolic"
         edges    : [{"parent_tokens", "child_token", "rel_type", "agg_op", "param"}, ...]
         """
-        completion = self.client.chat.completions.create(
-            model="qwen-turbo",
-            messages=[
+        url = f"{self.base_url}/api/chat"
+        payload = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": self.system_prompt},
-                {"role": "user",   "content": user_prompt}
+                {"role": "user", "content": user_prompt}
             ],
-            temperature=0.1,
-            response_format={"type": "json_object"}
-        )
-        content = completion.choices[0].message.content
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": 2048
+            },
+            "keep_alive": 0  # 不保留会话历史
+        }
+        response = requests.post(url, json=payload, timeout=120)
+        response.raise_for_status()
+        result = response.json()
+        content = result['message']['content']
         content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
 
         result = json.loads(content)
