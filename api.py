@@ -35,7 +35,7 @@ import requests
 
 
 class NERAPI:
-    def __init__(self, model: str = "qwen3.5-4b", base_url: str = "http://localhost:11434"):
+    def __init__(self, model: str = "ner:latest", base_url: str = "http://localhost:11434"):
         self.model = model
         self.base_url = base_url
         self.system_prompt = """
