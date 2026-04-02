@@ -1,5 +1,5 @@
 """
-sanitizer_module.py  —  实体级三模式脱敏系统
+sanitizer_module.py  —  实体级双模式脱敏系统
 
 设计原则
 --------
@@ -8,18 +8,14 @@ t1 实体（姓名/手机/组织等）
     → 反脱敏：在 LLM 响应中 find(密文) → 替换回原文
     → 跨会话：每轮 refresh_session_tweak()，相同实体在不同会话密文不同
 
-t2 perturb（年龄/血糖/血压等"引用型"数值）
+t2 实体（所有数值类型）
     → mLDP 扰动后的裸数字直接嵌入 prompt，LLM 基于近似值回答
     → 【无需反脱敏】：LLM 的回答本就针对扰动值，是有效近似结果
+    → DAG 保证关联数值（如单价/数量/总价）扰动后仍满足数学关系
     → Vault 只记录用于审计，不参与反脱敏流程
 
-t2 symbolic（月薪/单价等"计算型"数值）
-    → 不扰动，用占位符 [TYPE_N] 替换，要求 LLM 保留占位符输出含符号的公式
-    → 反脱敏：正则找 [TYPE_N] → 替换为原值，再对数学表达式求值
-
-反脱敏只需两步
+反脱敏只需一步
     步骤1：t1 FPE 密文 → 原文
-    步骤2：t2 symbolic [TYPE_N] → 原值 + 表达式求值
 
 安全说明
 --------
@@ -37,29 +33,15 @@ import re
 from typing import Dict, List, Optional, Tuple, Union
 
 from ff3_module import FPEManager
-from api import NERAPI, is_t1, is_symbolic, is_perturb, T1_LABELS, T2_LABELS
+from api import NERAPI, is_t1, is_t2
 from dag_module import T2DAGProcessor
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 
-# 反脱敏正则：只需匹配 [TYPE_N] 占位符
-_PH_RE   = re.compile(r"\[([A-Z_]+)_(\d+)\]")
-# 简单四则运算求值正则
-_MATH_RE = re.compile(
-    r'(-?\d+(?:\.\d+)?)\s*([+\-×x\*÷/])\s*(-?\d+(?:\.\d+)?)'
-)##修改成复杂计算函数识别
-
-SYMBOLIC_SYSTEM_PROMPT = """
-重要提示：输入中的 [TYPE_INDEX] 格式标记（如 [SALARY_0]）是数值占位符，
-代表用户的真实数值（已隐藏保护）。
-
-请严格遵守：
-1. 完整保留所有占位符，不要替换为具体数字
-2. 用占位符参与运算表达式：结果 = [SALARY_0] × 0.80
-3. 只输出含占位符的计算公式，不要自行代入求值
-"""
+# 反脱敏正则：匹配 t1 FPE 密文（无需 symbolic 占位符正则）
+_PH_RE   = re.compile(r"\[([A-Z_]+)_(\d+)\]")  # 保留备用，当前不使用
 
 
 # ---------------------------------------------------------------------------
@@ -89,34 +71,6 @@ def _infer_precision(token: str) -> int:
     return len(token.split('.')[1]) if '.' in token else 0
 
 
-def _get_t2_ph_type(label: str) -> str:
-
-    return label if label in T2_LABELS else "NUM"
-
-
-def _make_placeholder(ph_type: str, index: int) -> str:
-    return f"[{ph_type}_{index}]"
-
-
-def _eval_math_in_text(text: str) -> str:
-    """
-    对文本中的简单四则运算表达式求值。
-    防御除以零；整数结果不带小数点。
-    """
-    def _compute(m: re.Match) -> str:
-        try:
-            a, op, b = float(m.group(1)), m.group(2), float(m.group(3))
-            if   op in ('*', '×', 'x'): r = a * b
-            elif op in ('/', '÷'):
-                if b == 0:
-                    return m.group(0)
-                r = a / b
-            elif op == '+':             r = a + b
-            else:                       r = a - b
-            return str(int(r)) if r == int(r) else f"{r:.2f}"
-        except Exception:
-            return m.group(0)
-    return _MATH_RE.sub(_compute, text)
 
 
 # ---------------------------------------------------------------------------
@@ -153,29 +107,11 @@ class Vault:
             "noisy_val": noisy_val,
         }
 
-    def store_t2_symbolic(
-        self,
-        ph:       str,
-        original: str,
-        orig_val: Union[int, float],
-    ) -> None:
-        self._data[ph] = {
-            "type":     "t2_symbolic",
-            "original": original,
-            "orig_val": orig_val,
-        }
-
     def get(self, key: str) -> Optional[Dict]:
         return self._data.get(key)
 
     def t1_ciphertexts(self) -> List[str]:
         return [k for k, v in self._data.items() if v["type"] == "t1"]
-
-    def placeholders(self) -> List[str]:
-        return [k for k, v in self._data.items() if v["type"] == "t2_symbolic"]
-
-    def has_symbolic(self) -> bool:
-        return any(v["type"] == "t2_symbolic" for v in self._data.values())
 
     def to_dict(self) -> Dict:
         return dict(self._data)
@@ -193,7 +129,7 @@ class Vault:
 
 class Sanitizer:
     """
-    三模式脱敏主类。
+    双模式脱敏主类。
 
     参数
     ----
@@ -219,48 +155,43 @@ class Sanitizer:
         ----
         sanitized_text : 发给 LLM 的脱敏文本
                          · t1 实体    → FPE 密文
-                         · t2 perturb → 裸扰动数字（直接可读）
-                         · t2 symbolic → [TYPE_N] 占位符
+                         · t2 实体    → 裸扰动数字（DAG 保证关联数值一致性）
         session_info   : 反脱敏所需会话信息（不含长期密钥 key）
         """
         session_tweak = self.fpe.refresh_session_tweak()
-        mode, ner_result, raw_edges = self.ner(prompt)
+        ner_result, raw_edges = self.ner(prompt)
         print(raw_edges)
-        # ── 收集 t2 perturb，送 DAG 扰动 ──────────────────────
+        # ── 收集 t2，送 DAG 扰动 ──────────────────────────────────
         t2_perturb_list: List[Tuple[int, str, Union[int, float]]] = []
-        t2_precision:    Dict[int, int] = {}
 
-        for i, (token, label, proc) in enumerate(ner_result):
-            if is_perturb(label, proc):
+        #提取t2实体
+        for i, (token, label) in enumerate(ner_result):
+            if is_t2(label):
                 ok, val = _parse_numeric(token)
                 if ok:
                     t2_perturb_list.append((i, token, val))
-                    t2_precision[i] = _infer_precision(token)
+
 
         noisy_map: Dict[int, Union[int, float]] = {}
         dag_info:  Dict = {}
 
         if t2_perturb_list:
-
             processor = T2DAGProcessor(total_epsilon=self.total_epsilon)
-            # DAG 内部处理整数；浮点先按精度放大，结果再缩回
             int_list = [
-                (idx, token, actual_value)  # actual_value 是原值（如 92.5）
+                (idx, token, actual_value)
                 for idx, token, actual_value in t2_perturb_list
             ]
             print(f"t2_list before process: {int_list}")
             raw_noisy, dag_info = processor.process(int_list, raw_edges)
+            print(f"raw_edges:{raw_edges}, dag_info:{dag_info}")
             for i, _t, _v in t2_perturb_list:
                 raw = raw_noisy.get(i)
                 if raw is not None:
-                    noisy_map[i] = raw  # 直接使用，不再处理精度
+                    noisy_map[i] = raw
                 else:
-                    # fallback: 使用原始值或扰动值
                     noisy_map[i] = _v
 
-        vault      = Vault()
-        ph_counter = 0
-
+        vault = Vault()
         # 按 token 长度从长到短排序，避免短 token 误匹配长 token 子串
         indexed_sorted = sorted(
             enumerate(ner_result),
@@ -270,7 +201,7 @@ class Sanitizer:
 
         sanitized_text = prompt
 
-        for i, (token, label, proc) in indexed_sorted:
+        for i, (token, label) in indexed_sorted:
 
             if is_t1(label):
                 # ── t1：FPE 密文嵌入 ────────────────────────────
@@ -278,8 +209,8 @@ class Sanitizer:
                 vault.store_t1(enc, token)
                 sanitized_text = sanitized_text.replace(token, enc, 1)
 
-            elif is_perturb(label, proc):
-                # ── t2 perturb：裸扰动数字直接嵌入 ─────────────
+            elif is_t2(label):
+                # ── t2：裸扰动数字直接嵌入 ──────────────────────
                 ok, val = _parse_numeric(token)
                 if not ok:
                     # 无法解析为数值（如 "130/80"）→ 降级为 t1 FPE
@@ -293,26 +224,13 @@ class Sanitizer:
                 vault.store_t2_perturb(noisy_str, token, val, noisy)
                 sanitized_text = sanitized_text.replace(token, noisy_str, 1)
 
-            elif is_symbolic(label, proc):
-                # ── t2 symbolic：占位符嵌入，不扰动 ────────────
-                _, val = _parse_numeric(token)
-                ph = _make_placeholder(_get_t2_ph_type(label), ph_counter)
-                ph_counter += 1
-                vault.store_t2_symbolic(ph, token, val)
-                sanitized_text = sanitized_text.replace(token, ph, 1)
-
         session_info: Dict = {
             "session_tweak": session_tweak,
             "eps_t2":        self.total_epsilon,
-            "mode":          mode,
-            "has_symbolic":  vault.has_symbolic(),
             "ner_result":    ner_result,
             "dag_info":      dag_info,
             "vault":         vault.to_dict(),
         }
-
-        if vault.has_symbolic():
-            session_info["symbolic_system_prompt"] = SYMBOLIC_SYSTEM_PROMPT
 
         return sanitized_text, session_info
 
@@ -322,11 +240,7 @@ class Sanitizer:
 
     def desanitizer(self, response: str, session_info: Dict) -> Tuple[str, Dict]:
         """
-        从 LLM 响应中还原脱敏实体。
-
-        步骤1：t1  — find(FPE密文) → 原文
-        步骤2：t2 symbolic — 正则 [TYPE_N] → 原值 + 数学表达式求值
-
+        从 LLM 响应中还原 t1 实体。
         t2 perturb 不参与反脱敏：LLM 基于扰动值给出的回答本就是有效近似结果。
 
         参数
@@ -340,13 +254,11 @@ class Sanitizer:
         audit    : 审计信息
         """
         vault   = Vault.from_dict(session_info.get("vault", {}))
-        has_sym = session_info.get("has_symbolic", False)
-
         found:   List[str] = []
         missing: List[str] = []
         restored = response
 
-        # ── 步骤1：还原 t1（FPE 密文 → 原文）────────────────────
+        # ── 还原 t1（FPE 密文 → 原文）────────────────────────────
         for enc in sorted(vault.t1_ciphertexts(), key=len, reverse=True):
             record = vault.get(enc)
             idx    = restored.find(enc)
@@ -360,42 +272,16 @@ class Sanitizer:
             else:
                 missing.append(enc)
 
-        # ── 步骤2：还原 t2 symbolic（[TYPE_N] → 原值）───────────
-        def _replace_ph(m: re.Match) -> str:
-            ph     = m.group(0)
-            record = vault.get(ph)
-            if record is None:
-                return ph
-            found.append(ph)
-            return str(record["orig_val"])
-
-        restored = _PH_RE.sub(_replace_ph, restored)
-
-        if has_sym:
-            restored = _eval_math_in_text(restored)
-
         # ── 审计 ─────────────────────────────────────────────────
-        # 只统计 t1 和 symbolic 的还原情况；perturb 不参与反脱敏，不纳入统计
-        all_sym_keys = set(vault.placeholders())
-        missing_sym  = sorted(all_sym_keys - set(found))
-
-        found_unique = list(dict.fromkeys(found))
-        billable     = len(vault.t1_ciphertexts()) + len(vault.placeholders())
+        billable = len(vault.t1_ciphertexts())
         audit: Dict = {
-            "mode":             session_info.get("mode", "standard"),
-            "has_symbolic":     has_sym,
-            "found":            found_unique,
-            "missing_t1":       missing,
-            "missing_symbolic": missing_sym,
-            "recovery_rate":    round(
-                len(found_unique) / max(billable, 1), 4
-            ),
+            "found":         list(dict.fromkeys(found)),
+            "missing_t1":    missing,
+            "recovery_rate": round(len(found) / max(billable, 1), 4),
         }
 
         if missing:
             print(f"[审计] {len(missing)} 个 t1 实体未出现: {missing}")
-        if missing_sym:
-            print(f"[审计] {len(missing_sym)} 个 symbolic 占位符未出现: {missing_sym}")
 
         return restored, audit
 
@@ -424,13 +310,10 @@ if __name__ == "__main__":
         ("整数t2",
          "In 2024, customer Zhang Wei purchased 3 items, "
          "each priced at 150 yuan, total 450 yuan, contact: 13800138000."),
-        ("浮点t2",
-         "患者张伟，血糖6.8，血压130，请问这些指标正常吗？"),
-        ("symbolic",
-         "My monthly salary is 12000, tax rate 20%, what is my after-tax income?"),
-        ("混合",
-         "张伟月薪12000，税后收入是多少？另外他血糖6.8，正常吗？"),
-        ("1","我叫小明，我的英语成绩是97，我的语文成绩是88，我的平均成绩是92.5")
+        ("成绩",
+         "我叫小明，我的英语成绩是97，我的语文成绩是88，我的平均成绩是92.5"),
+        ("多科目",
+         "小明期中考试：数学97分，语文88分，英语91分，平均分92.0分"),
     ]
 
     for tag, text in cases:
@@ -438,7 +321,6 @@ if __name__ == "__main__":
         print(f"原始: {text}")
         san, info = sanitizer.sanitizer(text)
         print(f"脱敏: {san}")
-        print(f"mode={info['mode']}  symbolic={info['has_symbolic']}")
 
         assert "fpe_key" not in info
         assert "session_tweak" in info
@@ -449,23 +331,10 @@ if __name__ == "__main__":
                 print(f"  {k!r} → [t1] orig={rec['original']!r}")
             elif t == "t2_perturb":
                 print(f"  {k!r} → [t2_perturb] orig={rec['orig_val']}  noisy={rec['noisy_val']}")
-            else:
-                print(f"  {k!r} → [t2_symbolic] orig={rec['orig_val']}")
 
-        if info["has_symbolic"]:
-            sym_phs = [k for k, r in info["vault"].items() if r["type"] == "t2_symbolic"]
-            ph = sym_phs[0]
-            fake = f"税后收入 = {ph} × (1 - 0.20) = {ph} × 0.80"
-            print(f"模拟LLM: {fake}")
-            restored, audit = sanitizer.desanitizer(fake, info)
-            print(f"反脱敏: {restored}")
-            print(f"恢复率: {audit['recovery_rate']}  missing_sym={audit['missing_symbolic']}")
-            assert 0 <= audit["recovery_rate"] <= 1
-            assert audit["missing_symbolic"] == []
-        else:
-            restored, audit = sanitizer.desanitizer(san, info)
-            print(f"反脱敏(t1还原): {restored}")
-            print(f"恢复率: {audit['recovery_rate']}")
+        restored, audit = sanitizer.desanitizer(san, info)
+        print(f"反脱敏(t1还原): {restored}")
+        print(f"恢复率: {audit['recovery_rate']}")
 
     # 跨会话验证
     print(f"\n{'='*65}  [跨会话验证]")

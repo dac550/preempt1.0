@@ -2,28 +2,18 @@
 dag_module.py
 
 基于有向无环图(DAG)的 t2 实体关联扰动模块。
-关系边由 NERAPI 一并返回，本模块不再调用 LLM。
+支持复合运算的中间节点处理。
 
 依赖关系类型（RelationType）：
   RATIO   : child = parent * param
   DIFF    : child = parent + param
   PERCENT : child = parent * param / 100
   COPY    : child = parent
-  AGG     : child = agg_op(p1, p2, ..., pN)   ← 多父节点聚合
 
-AGG 聚合操作（AggOp）：
-  sum  : child = p1 + p2 + ... + pN
-  avg  : child = (p1 + p2 + ... + pN) / N
-  max  : child = max(p1, ..., pN)
-  min  : child = min(p1, ..., pN)
-
-变更说明（v2）：
-  · DAGEdge 新增 parent_idxs（列表）和 agg_op 字段
-  · parent_idx 属性保留，单父节点时与 parent_idxs[0] 相同，多父节点时为 -1
-  · DAGBuilder 解析 parent_tokens（列表）而非 parent_token（字符串），向下兼容旧格式
-  · _verify_edge 增加 agg 验证分支
-  · DAGPerturber._derive_child_multi 增加 agg 推导逻辑
-  · _remove_cycles 兼容多父节点边
+中间节点规则：
+  - 命名格式：_tmp1, _tmp2, ... _tmpN
+  - 由复合运算拆解生成，不在原始 t2_entities 中
+  - 按编号顺序依次计算
 """
 
 from __future__ import annotations
@@ -31,9 +21,8 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
-
-from typing import Union
+from typing import Dict, List,  Tuple, Union
+import re
 
 
 # ---------------------------------------------------------------------------
@@ -41,30 +30,26 @@ from typing import Union
 # ---------------------------------------------------------------------------
 
 class RelationType(str, Enum):
-    RATIO   = "ratio"
-    DIFF    = "diff"
+    # 新版 prompt 使用的名称
+    MULTIPLY = "multiply"
+    ADD = "add"
     PERCENT = "percent"
-    COPY    = "copy"
-    AGG     = "agg"
-
-
-class AggOp(str, Enum):
-    SUM = "sum"
-    AVG = "avg"
-    MAX = "max"
-    MIN = "min"
+    COPY = "copy"
 
 
 @dataclass
 class T2Entity:
-    index: int   # 在 ner_result 中的下标
-    token: str   # 原始文本
-    value: Union[int,float]   # 解析后数值
-    precision: int=0
+    index: int  # 在 ner_result 中的下标，中间节点使用负数
+    token: str  # 原始文本或中间节点名（如 _tmp1）
+    value: Union[int, float]  # 解析后数值
+    precision: int = 0
+    is_temp: bool = False  # 是否为中间节点
+
     def __post_init__(self):
-        """自动计算精度"""
+        """自动计算精度（仅对非中间节点）"""
+        if self.is_temp:
+            return
         if isinstance(self.value, float):
-            # 计算小数位数
             str_val = str(self.value)
             if '.' in str_val:
                 self.precision = len(str_val.split('.')[1])
@@ -91,71 +76,37 @@ class T2Entity:
 
 @dataclass
 class DAGEdge:
-    parent_idxs: List[int]          # 所有父节点索引（单父时长度为1）
-    child_idx:   int
-    rel_type:    RelationType
-    param:       float = 1.0
-    agg_op:      Optional[AggOp] = None
-
-    @property
-    def parent_idx(self) -> int:
-        """兼容旧代码的单父节点访问，多父节点时返回 -1。"""
-        return self.parent_idxs[0] if len(self.parent_idxs) == 1 else -1
-
-    @property
-    def is_agg(self) -> bool:
-        return self.rel_type == RelationType.AGG
+    parent_idx: int  # 单父节点
+    child_idx: int
+    rel_type: RelationType
+    param: float = 1.0
 
 
 @dataclass
 class DAGGraph:
     graph_id: int
-    nodes:    List[int] = field(default_factory=list)
-    edges:    List[DAGEdge] = field(default_factory=list)
-    roots:    List[int] = field(default_factory=list)
-    epsilon:  float = 0.0
+    nodes: List[int] = field(default_factory=list)
+    edges: List[DAGEdge] = field(default_factory=list)
+    roots: List[int] = field(default_factory=list)
+    epsilon: float = 0.0
+    temp_nodes: Dict[int, T2Entity] = field(default_factory=dict)  # 中间节点映射
 
 
 # ---------------------------------------------------------------------------
-# 边验证
+# 工具函数
 # ---------------------------------------------------------------------------
 
-def _verify_edge(
-    parent_vals: List[Union[int,float]],
-    child_val:   Union[int,float],
-    rel:         RelationType,
-    param:       float,
-    agg_op:      Optional[AggOp] = None,
-    tol:         float = 0.01,
-) -> bool:
-    """
-    验证边关系是否与实际数值吻合。
-    tol: 相对误差容忍度（默认 1%），处理浮点和四舍五入误差。
-    """
-    if not parent_vals:
-        return False
+def is_temp_token(token: str) -> bool:
+    """判断是否为中间节点"""
+    return token.startswith("_tmp") or token.startswith("_")
 
-    if rel == RelationType.AGG:
-        if agg_op is None:
-            return False
-        if   agg_op == AggOp.SUM: expected = sum(parent_vals)
-        elif agg_op == AggOp.AVG: expected = sum(parent_vals) / len(parent_vals)
-        elif agg_op == AggOp.MAX: expected = max(parent_vals)
-        elif agg_op == AggOp.MIN: expected = min(parent_vals)
-        else: return False
-    else:
-        parent_val = parent_vals[0]
-        if parent_val == 0:
-            return False
-        if   rel == RelationType.RATIO:   expected = parent_val * param
-        elif rel == RelationType.DIFF:    expected = parent_val + param
-        elif rel == RelationType.PERCENT: expected = parent_val * param / 100
-        elif rel == RelationType.COPY:    expected = parent_val
-        else: return False
 
-    if expected == 0:
-        return child_val == 0
-    return abs(expected - child_val) / abs(expected) <= tol
+def get_temp_order(token: str) -> int:
+    """获取中间节点的序号，如 _tmp3 -> 3"""
+    match = re.search(r'_tmp(\d+)', token)
+    if match:
+        return int(match.group(1))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -166,81 +117,135 @@ class DAGBuilder:
     """
     输入：T2Entity 列表 + 原始边字典列表（来自 NERAPI）
     输出：若干 DAGGraph（并查集分连通分量，Kahn 算法去环）
+    支持中间节点处理：按 _tmp 编号顺序创建节点
     """
 
     def build(
-        self,
-        t2_entities:   List[T2Entity],
-        raw_edges:     List[Dict],
-        total_epsilon: float,
+            self,
+            t2_entities: List[T2Entity],
+            raw_edges: List[Dict],
+            total_epsilon: float,
     ) -> List[DAGGraph]:
         if not t2_entities:
             return []
-        print(raw_edges)
-        indices   = [e.index for e in t2_entities]
+
+        # 构建 token 映射
         token_map = {e.token: e for e in t2_entities}
 
-        # --- 解析边（含数值验证，丢弃不满足关系的边）---
-        parsed_edges: List[DAGEdge] = []
+        # 收集所有边，并识别中间节点
+        temp_tokens: set[str] = set()
+        all_tokens: set[str] = set()
 
         for ed in raw_edges:
-            # 兼容旧格式 parent_token（str）和新格式 parent_tokens（list）
             raw_parents = ed.get("parent_tokens") or (
                 [ed["parent_token"]] if "parent_token" in ed else []
             )
             child_token = ed.get("child_token", "")
+            for pt in raw_parents:
+                all_tokens.add(pt)
+                if is_temp_token(pt):
+                    temp_tokens.add(pt)
+            all_tokens.add(child_token)
+            if is_temp_token(child_token):
+                temp_tokens.add(child_token)
+
+        # 按编号排序中间节点
+        sorted_temp_tokens = sorted(temp_tokens, key=get_temp_order)
+
+        # 为中间节点创建临时实体（按顺序创建）
+        temp_nodes: Dict[str, T2Entity] = {}
+        temp_counter = 0
+        for token in sorted_temp_tokens:
+            if token not in token_map:
+                temp_entity = T2Entity(
+                    index=-(temp_counter + 1),
+                    token=token,
+                    value=0.0,
+                    is_temp=True
+                )
+                temp_nodes[token] = temp_entity
+                token_map[token] = temp_entity
+                temp_counter += 1
+
+        # 获取所有节点索引
+        indices = [e.index for e in t2_entities] + [e.index for e in temp_nodes.values()]
+
+        # --- 解析边 ---
+        parsed_edges: List[DAGEdge] = []
+
+        for ed in raw_edges:
+            raw_parents = ed.get("parent_tokens") or (
+                [ed["parent_token"]] if "parent_token" in ed else []
+            )
+            child_token = ed.get("child_token", "")
+            param_value = ed.get("param",1.0)
 
             parent_entities = [token_map[pt] for pt in raw_parents if pt in token_map]
-            child_entity    = token_map.get(child_token)
-            #调试
-            print(f"parent_entities: {[(e.index, e.token, e.value) for e in parent_entities]}")
-            print(f"child_entity: {child_entity}")
-
-            #调试
-            #child_val = child_entity.value
-            #print(f"child_val: {child_val} (type: {type(child_val)})")
-
+            child_entity = token_map.get(child_token)
 
             if not parent_entities or child_entity is None:
                 continue
 
-            parent_idxs = [e.index for e in parent_entities]
-            if child_entity.index in parent_idxs:
-                continue
+            # 复制父节点列表
+            actual_parents = list(parent_entities)
+            actual_param = param_value
 
+            # 检查 param 是否对应某个 t2 实体（通过数值匹配）
+            #尝试转化实体
             try:
-                rel = RelationType(ed.get("rel_type", "ratio"))
-            except ValueError:
-                rel = RelationType.RATIO
+                param_num = param_value
+            except (ValueError, TypeError):
+                param_num = None
 
-            param = float(ed.get("param", 1.0))
+            param_entity = None
+            if param_num is not None:
+                for token, entity in token_map.items():
+                    if not entity.is_temp and abs(entity.value - param_num) < 1e-9:
+                        param_entity = entity
+                        break
 
-            # 解析 agg_op
-            agg_op = None
-            if rel == RelationType.AGG:
-                raw_agg = ed.get("agg_op")
-                if raw_agg is None:
-                    continue
-                try:
-                    agg_op = AggOp(raw_agg)
-                except ValueError:
-                    continue
+            if param_entity and param_entity not in actual_parents:
+                actual_parents.append(param_entity)
+                actual_param = 1.0
+                print(f"[DAG] 将 param 值 {param_num} 对应的实体 '{param_entity.token}' 添加为父节点")
 
-            # 调试
-            parent_vals = [e.value for e in parent_entities]
-            print(f"parent_vals: {parent_vals} (types: {[type(v) for v in parent_vals]})")
-
-
-            if not _verify_edge(parent_vals, child_entity.value, rel, param, agg_op):
+            # 防止自环
+            parent_indices = [e.index for e in actual_parents]
+            if child_entity.index in parent_indices:
                 continue
 
-            parsed_edges.append(DAGEdge(
-                parent_idxs = parent_idxs,
-                child_idx   = child_entity.index,
-                rel_type    = rel,
-                param       = param,
-                agg_op      = agg_op,
-            ))
+            if len(actual_parents) == 1:
+                # 单父节点：保持原关系
+                rel = RelationType(ed.get("rel_type", "multiply"))
+                parsed_edges.append(DAGEdge(
+                    parent_idx=actual_parents[0].index,
+                    child_idx=child_entity.index,
+                    rel_type=rel,
+                    param=float(actual_param),
+                ))
+            else:
+                # 多父节点：使用聚合运算
+                rel_type = ed.get("rel_type", "sum")
+
+                if rel_type == "add" or rel_type == "sum":
+                    # 加法聚合：child = parent1 + parent2 + ... + parentN
+                    for p_entity in actual_parents:
+                        parsed_edges.append(DAGEdge(
+                            parent_idx=p_entity.index,
+                            child_idx=child_entity.index,
+                            rel_type=RelationType.ADD,
+                            param=1.0,
+                        ))
+
+                elif rel_type == "multiply" or rel_type == "product":
+                    # 乘法聚合：child = parent1 × parent2 × ... × parentN
+                    for p_entity in actual_parents:
+                        parsed_edges.append(DAGEdge(
+                            parent_idx=p_entity.index,
+                            child_idx=child_entity.index,
+                            rel_type=RelationType.MULTIPLY,
+                            param=1.0,
+                        ))
 
         # --- 去环 ---
         valid_edges = _remove_cycles(parsed_edges, indices)
@@ -260,8 +265,7 @@ class DAGBuilder:
                 uf[rb] = ra
 
         for e in valid_edges:
-            for pidx in e.parent_idxs:
-                union(pidx, e.child_idx)
+            union(e.parent_idx, e.child_idx)
 
         groups: Dict[int, List[int]] = defaultdict(list)
         for idx in indices:
@@ -269,25 +273,39 @@ class DAGBuilder:
 
         group_edges: Dict[int, List[DAGEdge]] = defaultdict(list)
         for e in valid_edges:
-            group_edges[find(e.parent_idxs[0])].append(e)
+            if e.parent_idx:
+                group_edges[find(e.parent_idx)].append(e)
+            else:
+                group_edges[find(e.child_idx)].append(e)
 
         # --- 构造 DAGGraph ---
         graphs: List[DAGGraph] = []
         for gid, (rep, nodes) in enumerate(groups.items()):
             g_edges = group_edges[rep]
-            in_deg  = {n: 0 for n in nodes}
+            in_deg = {n: 0 for n in nodes}
             for e in g_edges:
                 in_deg[e.child_idx] += 1
             roots = [n for n in nodes if in_deg[n] == 0]
+
+            # 收集此图中的中间节点
+            graph_temp_nodes = {}
+            for node_idx in nodes:
+                for token, entity in temp_nodes.items():
+                    if entity.index == node_idx:
+                        graph_temp_nodes[node_idx] = entity
+                        break
+
             graphs.append(DAGGraph(
-                graph_id = gid,
-                nodes    = nodes,
-                edges    = g_edges,
-                roots    = roots,
+                graph_id=gid,
+                nodes=nodes,
+                edges=g_edges,
+                roots=roots,
+                epsilon=0.0,
+                temp_nodes=graph_temp_nodes,
             ))
-        print(graphs)
+
         # --- 隐私预算：按根节点数量均分 ---
-        total_roots  = sum(len(g.roots) for g in graphs)
+        total_roots = sum(len(g.roots) for g in graphs)
         eps_per_root = total_epsilon / max(total_roots, 1)
         for g in graphs:
             g.epsilon = eps_per_root * len(g.roots)
@@ -300,7 +318,7 @@ class DAGBuilder:
 # ---------------------------------------------------------------------------
 
 class DAGPerturber:
-    """根节点 mLDP 扰动，子节点由关系推导。"""
+    """根节点 mLDP 扰动，子节点由关系推导。支持中间节点按顺序计算。"""
 
     def __init__(self):
         import mLDP_module as mLDP
@@ -314,90 +332,78 @@ class DAGPerturber:
             self._mldp_cache[key] = self._mLDP.mLDPMechanism(epsilon=epsilon)
         return self._mldp_cache[key]
 
-    def _perturb_root(self, entity:T2Entity, epsilon: float) -> Union[int,float]:
+    def _perturb_root(self, entity: T2Entity, epsilon: float) -> Union[int, float]:
         stored_value = entity.to_stored()
-
-        # 2. 扰动存储值
         noisy_stored = self._get_mldp(epsilon).perturb(stored_value)
 
-        # 3. 还原为实际值
         if entity.precision > 0:
             noisy_actual = noisy_stored / (10 ** entity.precision)
         else:
             noisy_actual = float(noisy_stored)
 
-        # 保持原始类型
         return noisy_actual
 
-    def _derive_single(self, parent_noisy: Union[int,float], edge: DAGEdge) -> float:
+    def _derive_single(self, parent_noisy: Union[int, float], edge: DAGEdge) -> float:
         """单父节点推导子节点值。"""
         rel, p = edge.rel_type, edge.param
-        if   rel == RelationType.RATIO:   return parent_noisy * p
-        elif rel == RelationType.DIFF:    return parent_noisy + p
-        elif rel == RelationType.PERCENT: return parent_noisy * p / 100
-        elif rel == RelationType.COPY:    return float(parent_noisy)
+        if rel == RelationType.MULTIPLY:
+            return parent_noisy * p
+        elif rel == RelationType.ADD:
+            return parent_noisy + p
+        elif rel == RelationType.PERCENT:
+            return parent_noisy * p / 100
+        elif rel == RelationType.COPY:
+            return float(parent_noisy)
         return float(parent_noisy)
 
-    def _derive_agg(self, parent_noisy_vals: List[Union[int,float]], agg_op: AggOp) -> Union[int,float]:
-        """多父节点聚合推导子节点值。"""
-        if not parent_noisy_vals:
+    def _aggregate_multi(self, parent_vals: List[Union[int, float]], edges: List[DAGEdge]) -> float:
+        """
+        多父节点聚合推导子节点值。
+        支持 add 和 multiply 两种聚合方式。
+        """
+        if not parent_vals or not edges:
             return 0.0
-        if   agg_op == AggOp.SUM: result = sum(parent_noisy_vals)
-        elif agg_op == AggOp.AVG: result = sum(parent_noisy_vals) / len(parent_noisy_vals)
-        elif agg_op == AggOp.MAX: result = max(parent_noisy_vals)
-        elif agg_op == AggOp.MIN: result = min(parent_noisy_vals)
-        else: result = sum(parent_noisy_vals)
 
-        return result
+        # 获取聚合类型（假设所有边类型相同）
+        rel_type = edges[0].rel_type
 
-    def _derive_child_multi(
-            self,
-            parent_actual_vals: List[Union[int, float]],
-            edges: List[DAGEdge],
-            child_entity: T2Entity,  # 只用于 fallback，不用于决定精度
-    ) -> Union[int, float]:
-        """
-        推导子节点值，由计算直接决定返回类型
-        """
-        if not parent_actual_vals or not edges:
-            return child_entity.value  # fallback
-
-        # 1. 计算子节点实际值（浮点数）
-        if edges[0].is_agg:
-            result_actual = self._derive_agg(parent_actual_vals, edges[0].agg_op)
-        elif len(edges) == 1:
-            result_actual = self._derive_single(parent_actual_vals[0], edges[0])
+        if rel_type == RelationType.ADD:
+            # 加法聚合：求和
+            return sum(parent_vals)
+        elif rel_type == RelationType.MULTIPLY:
+            # 乘法聚合：求积
+            result = 1.0
+            for v in parent_vals:
+                result *= v
+            return result
         else:
-            # 多父节点处理...
-            if all(e.rel_type == RelationType.RATIO for e in edges):
-                product = 1.0
-                for p_val, e in zip(parent_actual_vals, edges):
-                    product *= p_val
-                result_actual = product
-            else:
-                results = [self._derive_single(p, e) for p, e in zip(parent_actual_vals, edges)]
-                result_actual = sum(results) / len(results)
-        print(f"result_actual:{result_actual}")
-        return result_actual
+            # 其他类型回退到单父节点逻辑
+            return self._derive_single(parent_vals[0], edges[0])
 
     def perturb_graphs(
             self,
             graphs: List[DAGGraph],
             t2_entities: List[T2Entity],
     ) -> Dict[int, Union[int, float]]:
-        """扰动图，返回实际值"""
+        """扰动图，返回实际值。中间节点按拓扑顺序计算。"""
 
         entity_map = {e.index: e for e in t2_entities}
-        noisy_map: Dict[int, Union[int, float]] = {}  # 存储实际值
+        # 添加中间节点到映射
+        for graph in graphs:
+            for idx, temp_entity in graph.temp_nodes.items():
+                entity_map[idx] = temp_entity
+
+        noisy_map: Dict[int, Union[int, float]] = {}
 
         for graph in graphs:
             eps_per_root = graph.epsilon / max(len(graph.roots), 1)
 
-            # 1. 扰动根节点（内部处理精度转换）
+            # 1. 扰动根节点
             for root_idx in graph.roots:
-                noisy_map[root_idx] = self._perturb_root(
-                    entity_map[root_idx], eps_per_root
-                )
+                if root_idx in entity_map:
+                    noisy_map[root_idx] = self._perturb_root(
+                        entity_map[root_idx], eps_per_root
+                    )
 
             # 2. 构建子节点到入边的映射
             parents_of: Dict[int, List[DAGEdge]] = defaultdict(list)
@@ -417,32 +423,26 @@ class DAGPerturber:
 
                 # 4. 推导子节点（如果未计算）
                 if cur not in noisy_map and cur in parents_of:
-                    # 收集所有父节点的实际值
-                    parent_actual_vals = []
-                    edges_for_cur = []
+                    edges = parents_of[cur]
 
-                    for e in parents_of[cur]:
-                        # 检查所有父节点是否都已计算
-                        all_parents_ready = all(
-                            pidx in noisy_map for pidx in e.parent_idxs
-                        )
-                        if all_parents_ready:
-                            # 获取父节点的实际值
-                            for pidx in e.parent_idxs:
-                                parent_actual_vals.append(noisy_map[pidx])
-                            edges_for_cur.append(e)
+                    # 检查所有父节点是否都已计算
+                    all_parents_ready = all(e.parent_idx in noisy_map for e in edges)
 
-                    if parent_actual_vals and edges_for_cur:
-                        noisy_map[cur] = self._derive_child_multi(
-                            parent_actual_vals,
-                            edges_for_cur,
-                            entity_map[cur]
-                        )
+                    if all_parents_ready:
+                        # 收集所有父节点的扰动值
+                        parent_vals = [noisy_map[e.parent_idx] for e in edges]
 
+                        # 根据边数量选择推导方式
+                        if len(edges) == 1:
+                            # 单父节点
+                            noisy_map[cur] = self._derive_single(parent_vals[0], edges[0])
+                        else:
+                            # 多父节点聚合
+                            noisy_map[cur] = self._aggregate_multi(parent_vals, edges)
 
                 # 5. 更新入度
                 for edge in graph.edges:
-                    if cur in edge.parent_idxs:
+                    if cur == edge.parent_idx:
                         in_deg[edge.child_idx] -= 1
                         if in_deg[edge.child_idx] == 0 and edge.child_idx not in visited:
                             visited.add(edge.child_idx)
@@ -450,11 +450,11 @@ class DAGPerturber:
 
             # 6. 防御：未覆盖节点独立扰动
             for nid in graph.nodes:
-                if nid not in noisy_map:
+                if nid not in noisy_map and nid in entity_map:
                     noisy_map[nid] = self._perturb_root(
                         entity_map[nid], eps_per_root
                     )
-        print(f"noisy_map{noisy_map}")
+
         return noisy_map
 
 
@@ -467,36 +467,34 @@ class T2DAGProcessor:
 
     def __init__(self, total_epsilon: float):
         self.total_epsilon = total_epsilon
-        self.builder   = DAGBuilder()
+        self.builder = DAGBuilder()
         self.perturber = DAGPerturber()
 
     def process(
-        self,
-        t2_list:   List[Tuple[int, str, Union[int,float]]],
-        raw_edges: List[Dict],
-    ) -> Tuple[Dict[int, Union[int,float]], Dict]:
-
+            self,
+            t2_list: List[Tuple[int, str, Union[int, float]]],
+            raw_edges: List[Dict],
+    ) -> Tuple[Dict[int, Union[int, float]], Dict]:
         if not t2_list:
             return {}, {}
 
-        entities  = [T2Entity(index=i, token=t, value=v) for i, t, v in t2_list]
-        graphs    = self.builder.build(entities, raw_edges, self.total_epsilon)
+        entities = [T2Entity(index=i, token=t, value=v) for i, t, v in t2_list]
+        graphs = self.builder.build(entities, raw_edges, self.total_epsilon)
         noisy_map = self.perturber.perturb_graphs(graphs, entities)
-        print(f"noisy_map in process:{noisy_map}")
+
         dag_info = {
             "graphs": [
                 {
                     "graph_id": g.graph_id,
-                    "nodes":    g.nodes,
-                    "roots":    g.roots,
-                    "epsilon":  g.epsilon,
+                    "nodes": g.nodes,
+                    "roots": g.roots,
+                    "epsilon": g.epsilon,
                     "edges": [
                         {
-                            "parents": e.parent_idxs,
-                            "child":   e.child_idx,
-                            "rel":     e.rel_type.value,
-                            "agg_op":  e.agg_op.value if e.agg_op else None,
-                            "param":   e.param,
+                            "parent": e.parent_idx,
+                            "child": e.child_idx,
+                            "rel": e.rel_type.value,
+                            "param": e.param,
                         }
                         for e in g.edges
                     ],
@@ -509,21 +507,19 @@ class T2DAGProcessor:
 
 
 # ---------------------------------------------------------------------------
-# 辅助：Kahn 去环（兼容多父节点边）
+# 辅助：Kahn 去环
 # ---------------------------------------------------------------------------
 
 def _remove_cycles(edges: List[DAGEdge], all_nodes: List[int]) -> List[DAGEdge]:
     """
     拓扑排序去环。
-    agg 边：每个父节点都向子节点连虚拟有向边参与排序。
     """
-    adj:    Dict[int, List[int]] = defaultdict(list)
-    in_deg: Dict[int, int]       = {n: 0 for n in all_nodes}
+    adj: Dict[int, List[int]] = defaultdict(list)
+    in_deg: Dict[int, int] = {n: 0 for n in all_nodes}
 
     for e in edges:
-        for pidx in e.parent_idxs:
-            adj[pidx].append(e.child_idx)
-        in_deg[e.child_idx] = in_deg.get(e.child_idx, 0) + len(e.parent_idxs)
+        adj[e.parent_idx].append(e.child_idx)
+        in_deg[e.child_idx] = in_deg.get(e.child_idx, 0) + 1
 
     queue = deque(n for n in all_nodes if in_deg.get(n, 0) == 0)
     topo: List[int] = []
@@ -538,6 +534,5 @@ def _remove_cycles(edges: List[DAGEdge], all_nodes: List[int]) -> List[DAGEdge]:
     topo_set = set(topo)
     return [
         e for e in edges
-        if all(pidx in topo_set for pidx in e.parent_idxs)
-        and e.child_idx in topo_set
+        if e.parent_idx in topo_set and e.child_idx in topo_set
     ]
