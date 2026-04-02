@@ -41,8 +41,7 @@ class NERAPI:
             ],
             "stream": True,
             "options": {
-                "temperature": 0.1,
-                "num_predict": 2048
+                "temperature": 0.1
             },
             "keep_alive": 0  # 不保留会话历史
         }
