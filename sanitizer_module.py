@@ -32,7 +32,7 @@ t2 实体（所有数值类型）
 import re
 from typing import Dict, List, Optional, Tuple, Union
 
-from ff3_module import FPEManager
+from name_replacer_module import NameReplacer
 from api import NERAPI, is_t1, is_t2
 from dag_module import T2DAGProcessor
 
@@ -134,13 +134,11 @@ class Sanitizer:
     参数
     ----
     epsilon : 隐私预算（越小保护越强，t2 perturb 扰动越大）
-    key     : FPE 长期密钥（十六进制字符串）
-              首次使用不传，自动生成后通过 get_key_info() 取出离线保存
     """
 
-    def __init__(self, epsilon: float, key: Optional[str] = None):
+    def __init__(self, epsilon: float):
         self.total_epsilon = epsilon
-        self.fpe           = FPEManager(key=key)
+        self.name_replacer = NameReplacer()
         self.ner           = NERAPI()
 
     # ------------------------------------------------------------------
@@ -154,11 +152,12 @@ class Sanitizer:
         返回
         ----
         sanitized_text : 发给 LLM 的脱敏文本
-                         · t1 实体    → FPE 密文
-                         · t2 实体    → 裸扰动数字（DAG 保证关联数值一致性）
-        session_info   : 反脱敏所需会话信息（不含长期密钥 key）
+                         · t1 实体（姓名等） → 随机替换的假名
+                         · t2 实体           → 裸扰动数字（DAG 保证关联数值一致性）
+        session_info   : 反脱敏所需会话信息
         """
-        session_tweak = self.fpe.refresh_session_tweak()
+        # 刷新姓名替换器会话
+        self.name_replacer.refresh_session()
         ner_result, raw_edges = self.ner(prompt)
         print(raw_edges)
         # ── 收集 t2，送 DAG 扰动 ──────────────────────────────────
@@ -204,19 +203,19 @@ class Sanitizer:
         for i, (token, label) in indexed_sorted:
 
             if is_t1(label):
-                # ── t1：FPE 密文嵌入 ────────────────────────────
-                enc, _meta = self.fpe.encrypt_master(token)
-                vault.store_t1(enc, token)
-                sanitized_text = sanitized_text.replace(token, enc, 1)
+                # ── t1：姓名随机替换 ────────────────────────────
+                fake_name = self.name_replacer.replace_name(token)
+                vault.store_t1(fake_name, token)
+                sanitized_text = sanitized_text.replace(token, fake_name, 1)
 
             elif is_t2(label):
                 # ── t2：裸扰动数字直接嵌入 ──────────────────────
                 ok, val = _parse_numeric(token)
                 if not ok:
-                    # 无法解析为数值（如 "130/80"）→ 降级为 t1 FPE
-                    enc, _meta = self.fpe.encrypt_master(token)
-                    vault.store_t1(enc, token)
-                    sanitized_text = sanitized_text.replace(token, enc, 1)
+                    # 无法解析为数值（如 "130/80"）→ 降级为 t1 姓名替换
+                    fake_name = self.name_replacer.replace_name(token)
+                    vault.store_t1(fake_name, token)
+                    sanitized_text = sanitized_text.replace(token, fake_name, 1)
                     continue
 
                 noisy     = noisy_map.get(i, val)
@@ -225,7 +224,7 @@ class Sanitizer:
                 sanitized_text = sanitized_text.replace(token, noisy_str, 1)
 
         session_info: Dict = {
-            "session_tweak": session_tweak,
+            "name_session":  self.name_replacer.get_session_info(),
             "eps_t2":        self.total_epsilon,
             "ner_result":    ner_result,
             "dag_info":      dag_info,
@@ -258,19 +257,19 @@ class Sanitizer:
         missing: List[str] = []
         restored = response
 
-        # ── 还原 t1（FPE 密文 → 原文）────────────────────────────
-        for enc in sorted(vault.t1_ciphertexts(), key=len, reverse=True):
-            record = vault.get(enc)
-            idx    = restored.find(enc)
+        # ── 还原 t1（假名 → 原文）────────────────────────────
+        for fake_name in sorted(vault.t1_ciphertexts(), key=len, reverse=True):
+            record = vault.get(fake_name)
+            idx    = restored.find(fake_name)
             if idx != -1:
                 restored = (
                     restored[:idx]
                     + record["original"]
-                    + restored[idx + len(enc):]
+                    + restored[idx + len(fake_name):]
                 )
-                found.append(enc)
+                found.append(fake_name)
             else:
-                missing.append(enc)
+                missing.append(fake_name)
 
         # ── 审计 ─────────────────────────────────────────────────
         billable = len(vault.t1_ciphertexts())
@@ -289,13 +288,9 @@ class Sanitizer:
     # 工具方法
     # ------------------------------------------------------------------
 
-    def get_key_info(self) -> Dict:
-        """首次使用后调用此方法，取出 key 离线保存。"""
-        return {
-            "key":   self.fpe.key,
-            "tweak": self.fpe.tweak,
-            "note":  "key 为长期密钥，请离线保存，勿写入 session_info 或日志。",
-        }
+    def get_session_info(self) -> Dict:
+        """获取当前会话信息"""
+        return self.name_replacer.get_session_info()
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +299,7 @@ class Sanitizer:
 
 if __name__ == "__main__":
     sanitizer = Sanitizer(epsilon=1.0)
-    print(f"[密钥] key={sanitizer.get_key_info()['key']}  （请离线保存）\n")
+    print(f"[姓名替换模式] 使用随机姓名替换方案\n")
 
     cases = [
         ("整数t2",
@@ -322,8 +317,7 @@ if __name__ == "__main__":
         san, info = sanitizer.sanitizer(text)
         print(f"脱敏: {san}")
 
-        assert "fpe_key" not in info
-        assert "session_tweak" in info
+        assert "name_session" in info
 
         for k, rec in info["vault"].items():
             t = rec["type"]
@@ -340,8 +334,8 @@ if __name__ == "__main__":
     print(f"\n{'='*65}  [跨会话验证]")
     s1, i1 = sanitizer.sanitizer("张伟购买了商品")
     s2, i2 = sanitizer.sanitizer("张伟购买了商品")
-    assert i1["session_tweak"] != i2["session_tweak"]
+    assert i1["name_session"]["session_seed"] != i2["name_session"]["session_seed"]
     assert s1 != s2
     print(f"第1轮: {s1}")
     print(f"第2轮: {s2}")
-    print("tweak 不同: ✓  密文不同: ✓")
+    print("会话种子不同: ✓  假名不同: ✓")

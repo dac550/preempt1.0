@@ -1,287 +1,195 @@
 """
-main.py
-
-批量读取文本文件，对每行内容进行隐私脱敏，输出结果到对应文件。
-
-使用方式：
-    # 处理单个文件
-    python main.py input.txt
-
-    # 处理多个文件
-    python main.py input1.txt input2.txt input3.txt
-
-    # 处理整个目录下所有 .txt 文件
-    python main.py --dir ./data
-
-    # 指定输出目录（默认在原文件名后加 _sanitized）
-    python main.py --dir ./data --output_dir ./results
-
-    # 指定隐私预算 epsilon（默认 1.0）
-    python main.py --dir ./data --epsilon 0.5
-
-输出格式（每条记录）：
-    [原始] <原文>
-    [脱敏] <脱敏结果>
-    ----------------------------------------
+调用 Sanitizer 对 data.txt 中的文本进行脱敏处理
 """
 
-import argparse
-import os
-import sys
 import json
-from pathlib import Path
-from typing import List, Tuple
-from datetime import datetime
+import os
+from typing import List, Dict
 
+# 导入 sanitizer 模块
 from sanitizer_module import Sanitizer
 
 
-# ---------------------------------------------------------------------------
-# 核心处理
-# ---------------------------------------------------------------------------
-
-def process_line(sanitizer: Sanitizer, line: str) -> Tuple[str, str, dict]:
+def load_texts_from_file(file_path: str) -> List[str]:
     """
-    对单行文本执行脱敏。
-    返回 (原文, 脱敏结果, session_info)
+    从文件中读取文本，每行作为一个独立的待处理文本
+
+    Args:
+        file_path: 文件路径
+
+    Returns:
+        文本列表
     """
-    line = line.strip()
-    if not line:
-        return line, line, {}
-    try:
-        sanitized, session_info = sanitizer.sanitizer(line)
-        return line, sanitized, session_info
-    except Exception as e:
-        print(f"    [警告] 处理失败: {e}")
-        return line, f"[ERROR: {e}]", {}
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = [line.strip() for line in f.readlines() if line.strip()]
+
+    if not lines:
+        raise ValueError(f"文件为空: {file_path}")
+
+    return lines
 
 
-def process_file(
-    sanitizer:  Sanitizer,
-    input_path: Path,
-    output_path: Path,
-    verbose: bool = True,
-) -> dict:
+def save_results(
+        original_texts: List[str],
+        sanitized_texts: List[str],
+        session_infos: List[Dict],
+        output_dir: str = "./output"
+) -> None:
     """
-    处理单个文件，结果写入 output_path。
-    返回统计信息。
+    保存脱敏结果到文件
+
+    Args:
+        original_texts: 原始文本列表
+        sanitized_texts: 脱敏文本列表
+        session_infos: 会话信息列表
+        output_dir: 输出目录
     """
-    stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0}
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 读取所有行
-    try:
-        with open(input_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except Exception as e:
-        print(f"  [错误] 无法读取 {input_path}: {e}")
-        stats["failed"] += 1
-        return stats
+    # 保存脱敏后的文本
+    with open(f"{output_dir}/sanitized_output.txt", 'w', encoding='utf-8') as f:
+        for i, text in enumerate(sanitized_texts):
+            f.write(f"[{i + 1}] {text}\n")
+            f.write("-" * 50 + "\n")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # 保存原始文本与脱敏文本对照
+    with open(f"{output_dir}/comparison.txt", 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("原始文本 vs 脱敏文本 对照表\n")
+        f.write("=" * 80 + "\n\n")
 
-    results = []   # [(orig, sanitized, session_info), ...]
+        for i, (orig, san) in enumerate(zip(original_texts, sanitized_texts)):
+            f.write(f"\n[{i + 1}] 原始文本:\n")
+            f.write(f"{orig}\n\n")
+            f.write(f"[{i + 1}] 脱敏文本:\n")
+            f.write(f"{san}\n")
+            f.write("-" * 80 + "\n")
 
-    for idx, line in enumerate(lines, 1):
-        stripped = line.strip()
-        stats["total"] += 1
+    # 保存会话信息（注意：session_info 包含 vault，可能较大）
+    # 只保存必要信息，避免敏感信息泄露
+    simplified_infos = []
+    for info in session_infos:
+        simplified = {
+            "session_tweak": info.get("session_tweak"),
+            "eps_t2": info.get("eps_t2"),
+            "ner_result": info.get("ner_result"),
+            "dag_info": info.get("dag_info"),
+            "vault_keys": list(info.get("vault", {}).keys()) if info.get("vault") else [],
+        }
+        simplified_infos.append(simplified)
 
-        if not stripped:
-            results.append(("", "", {}))
-            stats["skipped"] += 1
-            continue
+    with open(f"{output_dir}/session_infos.json", 'w', encoding='utf-8') as f:
+        json.dump(simplified_infos, f, ensure_ascii=False, indent=2)
 
-        if verbose:
-            print(f"  [{idx}/{len(lines)}] {stripped[:60]}{'...' if len(stripped) > 60 else ''}")
-
-        orig, sanitized, session_info = process_line(sanitizer, stripped)
-
-        if sanitized.startswith("[ERROR"):
-            stats["failed"] += 1
-        else:
-            stats["success"] += 1
-
-        results.append((orig, sanitized, session_info))
-        if verbose:
-            print(f"           → {sanitized[:60]}{'...' if len(sanitized) > 60 else ''}")
-
-    # 写入结果文件（可读文本格式）
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(f"# epsilon : {sanitizer.total_epsilon}\n")
-        f.write("=" * 60 + "\n\n")
-
-        for orig, sanitized, _ in results:
-            if not orig:
-                f.write("\n")
-                continue
-
-            f.write(f"{sanitized}\n")
+    print(f"\n结果已保存到: {output_dir}/")
+    print(f"  - sanitized_output.txt : 脱敏后文本")
+    print(f"  - comparison.txt       : 原始/脱敏对照")
+    print(f"  - session_infos.json   : 会话信息（简化版）")
 
 
-    # 同时写一份 JSON 格式（含 session_info，可用于反脱敏）
-    json_path = output_path.with_suffix(".json")
-    json_records = []
-    for orig, sanitized, session_info in results:
-        if not orig:
-            continue
-        # session_info 中的 tuple key 需转为字符串才能 JSON 序列化
-        serializable_info = _make_serializable(session_info)
-        json_records.append({
-            "original":  orig,
-            "sanitized": sanitized,
-            "session":   serializable_info,
-        })
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(json_records, f, ensure_ascii=False, indent=2)
+def run_sanitizer_demo(
+        file_path: str = "data.txt",
+        epsilon: float = 1.0,
+        output_dir: str = "./output"
+) -> None:
+    """
+    运行脱敏器主函数
 
-    return stats
+    Args:
+        file_path: 输入文件路径
+        epsilon: 隐私预算（越小保护越强）
+        output_dir: 输出目录
+    """
+    # 1. 读取数据
+    print(f"正在读取文件: {file_path}")
+    texts = load_texts_from_file(file_path)
+    print(f"共读取 {len(texts)} 条文本\n")
 
+    # 2. 初始化 Sanitizer
+    print("初始化 Sanitizer...")
+    print(f"隐私预算 epsilon = {epsilon}\n")
+    sanitizer = Sanitizer(epsilon=epsilon)
 
-def _make_serializable(obj):
-    """递归将不可 JSON 序列化的类型转换（tuple key → str）。"""
-    if isinstance(obj, dict):
-        return {str(k): _make_serializable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_make_serializable(i) for i in obj]
-    return obj
+    # 3. 逐条脱敏
+    sanitized_texts = []
+    session_infos = []
 
+    for idx, text in enumerate(texts):
+        print(f"\n{'=' * 60}")
+        print(f"处理第 {idx + 1}/{len(texts)} 条:")
+        print(f"原始: {text}")
 
-# ---------------------------------------------------------------------------
-# 文件收集
-# ---------------------------------------------------------------------------
+        try:
+            san_text, session_info = sanitizer.sanitizer(text)
+            print(f"脱敏: {san_text}")
 
-def collect_input_files(
-    file_args: List[str],
-    dir_arg:   str | None,
-    extensions: List[str],
-) -> List[Path]:
-    """收集所有待处理的输入文件路径。"""
-    paths: List[Path] = []
+            sanitized_texts.append(san_text)
+            session_infos.append(session_info)
 
-    # 直接指定的文件
-    for f in file_args:
-        p = Path(f)
-        if not p.exists():
-            print(f"[警告] 文件不存在，跳过: {f}")
-        elif not p.is_file():
-            print(f"[警告] 不是文件，跳过: {f}")
-        else:
-            paths.append(p)
+            # 打印 vault 中的映射信息
+            vault = session_info.get("vault", {})
+            for enc, rec in vault.items():
+                if rec["type"] == "t1":
+                    print(f"  t1映射: {enc!r} → {rec['original']!r}")
+                elif rec["type"] == "t2_perturb":
+                    print(f"  t2映射: {rec['original']!r} → {rec['noisy_val']} (扰动)")
 
-    # 目录模式
-    if dir_arg:
-        d = Path(dir_arg)
-        if not d.is_dir():
-            print(f"[错误] 目录不存在: {dir_arg}")
-        else:
-            for ext in extensions:
-                paths.extend(sorted(d.glob(f"*{ext}")))
+        except Exception as e:
+            print(f"处理失败: {e}")
+            sanitized_texts.append(f"[ERROR: {e}]")
+            session_infos.append({})
 
-    return paths
+    # 4. 保存结果
+    save_results(texts, sanitized_texts, session_infos, output_dir)
 
+    # 5. 可选：演示反脱敏（只对第一条进行）
+    if sanitized_texts and session_infos[0]:
+        print(f"\n{'=' * 60}")
+        print("反脱敏演示（仅还原 t1 实体）:")
 
-def build_output_path(
-    input_path:  Path,
-    output_dir:  str | None,
-    suffix:      str = "_sanitized",
-) -> Path:
-    """根据输入路径生成输出路径。"""
-    if output_dir:
-        out_dir = Path(output_dir)
-    else:
-        out_dir = input_path.parent / "sanitized_output"
-
-    stem = input_path.stem + suffix
-    return out_dir / (stem + ".txt")
-
-
-# ---------------------------------------------------------------------------
-# CLI 入口
-# ---------------------------------------------------------------------------
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="批量文本隐私脱敏工具",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument(
-        "files", nargs="*",
-        help="直接指定一个或多个输入文件"
-    )
-    parser.add_argument(
-        "--dir", "-d", default=None,
-        help="批量处理目录下所有文本文件"
-    )
-    parser.add_argument(
-        "--ext", nargs="+", default=[".txt"],
-        help="目录模式下处理的文件扩展名（默认 .txt）"
-    )
-    parser.add_argument(
-        "--output_dir", "-o", default=None,
-        help="输出目录（默认在输入文件同级建 sanitized_output/）"
-    )
-    parser.add_argument(
-        "--epsilon", "-e", type=float, default=1.0,
-        help="隐私预算 epsilon（默认 1.0，越小隐私保护越强）"
-    )
-    parser.add_argument(
-        "--key", default=None,
-        help="FPE 加密密钥（十六进制字符串，不指定则随机生成）"
-    )
-    parser.add_argument(
-        "--quiet", "-q", action="store_true",
-        help="静默模式，不打印每行处理进度"
-    )
-    return parser.parse_args()
+        restored, audit = sanitizer.desanitizer(sanitized_texts[0], session_infos[0])
+        print(f"原始文本:     {texts[0]}")
+        print(f"脱敏文本:     {sanitized_texts[0]}")
+        print(f"反脱敏后:     {restored}")
+        print(f"t1 恢复率:    {audit['recovery_rate']}")
+        if audit.get('missing_t1'):
+            print(f"未出现的 t1: {audit['missing_t1']}")
 
 
 def main():
-    args = parse_args()
+    """主函数"""
+    import argparse
 
-    # 收集文件
-    input_files = collect_input_files(args.files, args.dir, args.ext)
-    if not input_files:
-        print("未找到任何输入文件。请通过位置参数指定文件，或使用 --dir 指定目录。")
-        print("示例：python main.py input.txt")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="数据脱敏工具")
+    parser.add_argument(
+        "--input", "-i",
+        type=str,
+        default="data.txt",
+        help="输入文件路径（默认: data.txt）"
+    )
+    parser.add_argument(
+        "--epsilon", "-e",
+        type=float,
+        default=1.0,
+        help="隐私预算 epsilon，越小保护越强（默认: 1.0）"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default="./output",
+        help="输出目录（默认: ./output）"
+    )
 
-    print(f"\n{'='*60}")
-    print(f"  隐私脱敏批处理工具")
-    print(f"  待处理文件数: {len(input_files)}")
-    print(f"  epsilon     : {args.epsilon}")
-    print(f"{'='*60}\n")
+    args = parser.parse_args()
 
-    # 初始化 Sanitizer（所有文件共用同一密钥）
-    sanitizer = Sanitizer(epsilon=args.epsilon, key=args.key)
-    print(f"[密钥] key={sanitizer.fpe.key}  tweak={sanitizer.fpe.tweak}\n")
-
-    total_stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0}
-
-    for i, input_path in enumerate(input_files, 1):
-        output_path = build_output_path(input_path, args.output_dir)
-        print(f"[{i}/{len(input_files)}] 处理: {input_path}")
-        print(f"         输出: {output_path}")
-
-        stats = process_file(
-            sanitizer=sanitizer,
-            input_path=input_path,
-            output_path=output_path,
-            verbose=not args.quiet,
-        )
-
-        for k in total_stats:
-            total_stats[k] += stats[k]
-
-        print(f"         完成: 成功={stats['success']} 跳过={stats['skipped']} 失败={stats['failed']}\n")
-
-    # 汇总
-    print(f"{'='*60}")
-    print(f"  全部完成")
-    print(f"  总行数: {total_stats['total']}")
-    print(f"  成功  : {total_stats['success']}")
-    print(f"  跳过  : {total_stats['skipped']}（空行）")
-    print(f"  失败  : {total_stats['failed']}")
-    print(f"{'='*60}\n")
+    run_sanitizer_demo(
+        file_path=args.input,
+        epsilon=args.epsilon,
+        output_dir=args.output
+    )
 
 
 if __name__ == "__main__":
