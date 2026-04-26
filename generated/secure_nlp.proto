@@ -1,0 +1,64 @@
+// proto/secure_nlp.proto
+syntax = "proto3";
+
+package secure_nlp;
+
+// ============================================================================
+// 本地 → 云端 TEE 的请求
+// ============================================================================
+
+message T2Entity {
+    string token = 1;               // 原始 token，如 "500.75"
+    string label = 2;               // 实体类型，如 "AMOUNT"
+    double value = 3;               // 解析后的数值（处理例如1/3这样的信息）
+    int32 start_pos = 4;            // 在原文中的起始位置（防止存在数值相同的不同实体）
+    int32 end_pos = 5;              // 在原文中的结束位置（防止存在数值相同的不同实体）
+}
+
+message TEEProcessRequest {
+    string fpe_sanitized_text = 1;  // FPE 粗脱敏后的文本
+    repeated T2Entity t2_entities = 2; // t2 实体识别结果
+    float epsilon = 3;              // 隐私预算
+}
+
+// ============================================================================
+// 云端 TEE → 本地的回传
+// ============================================================================
+
+message RelationEdge {
+    int32 from_entity_index = 1;    // 源实体在 t2_entities 中的索引（父节点）
+    int32 to_entity_index = 2;      // 目标实体索引（字节点）
+    string relation_type = 3;       // "multiply", "add", "percent", "copy"
+    double param = 4;               // 关系参数
+    bool has_temp_node = 5;         // 是否需要中间节点
+    string temp_node_name = 6;      // 中间节点名（如 "_tmp1"）
+}
+//语义识别的部分（因为现在还没构思好如何实现，暂且待定）
+/*message SemanticAnalysis {
+    string topic = 1;
+    string intent = 2;
+    repeated string keywords = 3;
+    repeated float embedding = 4;
+    string context_summary = 5;
+}*/
+
+message TEEProcessResponse {
+    repeated RelationEdge edges = 1;
+    //SemanticAnalysis semantic = 2;
+    bytes attestation_report = 3;   // TEE 远程证明报告（安全性）
+}
+
+// ============================================================================
+// gRPC 服务
+// ============================================================================
+
+service SecureNLPService {
+    rpc ProcessInTEE(TEEProcessRequest) returns (TEEProcessResponse);
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message HealthCheckRequest {}
+message HealthCheckResponse {
+    bool healthy = 1;
+    string message = 2;
+}

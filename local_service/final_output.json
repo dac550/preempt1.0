@@ -1,0 +1,52 @@
+[
+  {
+    "original_text": "小明今年12岁了",
+    "sanitized_text": "桑瑾瑜今年10岁了",
+    "dag_info": {
+      "graphs": [
+        {
+          "graph_id": 0,
+          "nodes": [
+            0
+          ],
+          "roots": [
+            0
+          ],
+          "epsilon": 1.0,
+          "edges": []
+        }
+      ],
+      "noisy_map": {
+        "0": 10
+      }
+    },
+    "local_session": {
+      "name_session": {
+        "session_seed": 955837,
+        "name_mapping": {
+          "小明": "桑瑾瑜"
+        }
+      },
+      "fpe_key_material": {
+        "key": "1970B5FA1E06F120EBD719561CBC028C",
+        "tweak": "ACF056F997251A"
+      },
+      "ner_result": [
+        [
+          "小明",
+          "PERSON"
+        ],
+        [
+          "12",
+          "AGE"
+        ]
+      ],
+      "vault": {
+        "桑瑾瑜": {
+          "type": "t1_name",
+          "original": "小明"
+        }
+      }
+    }
+  }
+]
